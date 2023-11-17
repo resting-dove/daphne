@@ -1,0 +1,10 @@
+N = 4;
+M = 2;
+A = fill(5.0, N, M); 
+b = fill(3.0, M, 1);
+
+c = A@b;
+
+print(c);
+
+// Is treated just like a non-square matmul so far.

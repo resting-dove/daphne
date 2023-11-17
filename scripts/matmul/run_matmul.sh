@@ -1,0 +1,1 @@
+./bin/daphne --mlir-codegen ./scripts/matmul/matmul2048.daph

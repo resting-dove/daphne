@@ -1,0 +1,14 @@
+N = 2048;
+A = rand(N, N, -10.0, 10.0, 1.0, 42);
+B = rand(N, N, -10.0, 10.0, 1.0, 44);
+
+start = now();
+C = A@B;
+end = now();
+
+print("GEMM took ", 0);
+print((end-start)/1000000.0, 0);
+print("ms", 1);
+//print(C); // for small matrices
+
+print(sum(C)); // if don't want to print large matrices
