@@ -17,6 +17,8 @@
 #include <cstddef>
 #include <iostream>
 #include <memory>
+#include <ostream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -27,6 +29,8 @@
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/raw_os_ostream.h"
+#include "llvm/Support/raw_ostream.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
@@ -62,29 +66,30 @@ using namespace mlir;
 static constexpr int ROW = 0;
 static constexpr int COL = 1;
 
-void affineMatMul(mlir::Value &lhs, mlir::Value &rhs, mlir::Value &output,
+llvm::SmallVector<AffineForOp, 3> affineMatMul(mlir::Value &lhs, mlir::Value &rhs, mlir::Value &output,
                   ConversionPatternRewriter &rewriter, mlir::Location loc,
                   ArrayRef<int64_t> lhsShape, ArrayRef<int64_t> rhsShape,
                   mlir::MLIRContext *ctx) {
+    llvm::SmallVector<AffineForOp, 3> loops;
     // row loop
     auto rowLoop = rewriter.create<AffineForOp>(loc, 0, lhsShape[ROW], 1);
-    for (Operation &nested : *rowLoop.getBody()) {
+    /* for (Operation &nested : *rowLoop.getBody()) {
         rewriter.eraseOp(&nested);
-    }
+    } */
     // row loop body
     rewriter.setInsertionPointToStart(rowLoop.getBody());
     // fma loop
     auto fmaLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[ROW], 1);
-    for (Operation &nested : *fmaLoop.getBody()) {
+    /* for (Operation &nested : *fmaLoop.getBody()) {
         rewriter.eraseOp(&nested);
-    }
+    } */
     // inner loop body
     rewriter.setInsertionPointToStart(fmaLoop.getBody());
     // col loop
     auto colLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[COL], 1);
-    for (Operation &nested : *colLoop.getBody()) {
+    /* for (Operation &nested : *colLoop.getBody()) {
         rewriter.eraseOp(&nested);
-    }
+    } */
     // col loop body
     rewriter.setInsertionPointToStart(colLoop.getBody());
 
@@ -98,21 +103,56 @@ void affineMatMul(mlir::Value &lhs, mlir::Value &rhs, mlir::Value &output,
 
     // fma
     mlir::Value fma = rewriter.create<mlir::math::FmaOp>(loc, a, b, c);
-    //mlir::Value mult = rewriter.create<arith::MulFOp>(loc, a, b);
-    //mlir::Value fma = rewriter.create<arith::FoP>(loc, a, b, c);
-
 
     // store
     rewriter.create<AffineStoreOp>(loc, fma, output,
                                      ValueRange{rowLoop.getInductionVar(), colLoop.getInductionVar()});
 
     // AffineYieldOp at end of loop blocks
-    rewriter.create<AffineYieldOp>(loc);
+    //rewriter.create<AffineYieldOp>(loc);
     rewriter.setInsertionPointAfter(colLoop);
-    rewriter.create<AffineYieldOp>(loc);
+    //rewriter.create<AffineYieldOp>(loc);
     rewriter.setInsertionPointAfter(fmaLoop);
-    rewriter.create<AffineYieldOp>(loc);
+    //rewriter.create<AffineYieldOp>(loc);
     rewriter.setInsertionPointAfter(rowLoop);
+
+    //colLoop.getLoopBody().back().erase();
+    //rewriter.eraseOp(&*rowLoop.getBody()->end());
+
+    loops.push_back(rowLoop);
+    loops.push_back(fmaLoop);
+    loops.push_back(colLoop);
+    return loops;
+}
+
+void getPerfectlyNestedLoops2(SmallVectorImpl<AffineForOp> &nestedLoops,
+                                   AffineForOp root) {
+  for (unsigned i = 0; i < std::numeric_limits<unsigned>::max(); ++i) {
+    nestedLoops.push_back(root);
+    Block &body = root.getRegion().front();
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    body.print(os);
+    std::cout << "Root name " << root->getName().getStringRef().str() << "; " << s << std::endl;
+    root->dump();
+    std::cout << std::endl;
+    if (body.begin() != std::prev(body.end(), 2))
+    {
+        std::cout << "Children ";
+        for (auto o=body.begin(); o!=body.end(); o++)
+        {
+            
+            std::cout << o->getName().getStringRef().str() << " ";
+        }
+        std::cout << std::endl;
+        return;
+    }
+
+    root = dyn_cast<AffineForOp>(&body.front());
+    if (!root){
+        std::cout << "B End at " << i << std::endl;
+      return;}
+  }
 }
 
 class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
@@ -162,9 +202,24 @@ class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
         affineFillMemRef(0.0, rewriter, loc, outputMemRefType.getShape(),
                          op->getContext(), outputMemRef, matrixElementType);
         // Do the actual MatMul with hand built codegen
-        affineMatMul(lhs, rhs, outputMemRef, rewriter, loc,
+        auto loops = affineMatMul(lhs, rhs, outputMemRef, rewriter, loc,
                      lhsMemRefType.getShape(), rhsMemRefType.getShape(),
                      op->getContext());
+        daphne::createPrintIRPass();
+        llvm::SmallVector<AffineForOp> loopNest;
+        getPerfectlyNestedLoops2(loopNest, loops.front());
+        llvm::SmallVector<AffineForOp> loopNest3;
+        getPerfectlyNestedLoops2(loopNest3, loops.back());
+        llvm::SmallVector<AffineForOp> loopNest2;
+        loops.pop_back();
+        getPerfectlyNestedLoops2(loopNest2, loops.back());
+        std::cout << "Outer loop: " << isPerfectlyNested(loopNest)  << loopNest.size() << std::endl;
+        std::cout << "FMA loop: " << isPerfectlyNested(loopNest2)  << loopNest2.size() << std::endl;
+        std::cout << "Inner Loop : " << isPerfectlyNested(loopNest3)  << loopNest3.size() << std::endl;
+        
+        /* if (failed(tilePerfectlyNested(loopNest, {4, 8}))){
+            std::cout << "Tiling the loops failed" << std::endl;
+        }; */
 
         mlir::Value DM = convertMemRefToDenseMatrix(loc, rewriter, outputMemRef,
                                                     op.getType());

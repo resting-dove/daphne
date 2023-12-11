@@ -32,6 +32,7 @@
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -41,6 +42,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -301,12 +303,17 @@ void DaphneIrExecutor::buildCodegenPipeline(mlir::PassManager &pm) {
 
     if (!userConfig_.use_mlir_hybrid_codegen) {
         pm.addPass(mlir::daphne::createMatMulOpLoweringPass());
+        if (userConfig_.explain_mlir_codegen)
+            pm.addPass(
+                 mlir::daphne::createPrintIRPass("IR after MatMulOp lowering Pass"));
     }
-    uint64_t cacheSizeBytes = 128000; //TODO: Should this be a UserConfig or be read from somewhere?
+    
+
+    /* uint64_t cacheSizeBytes = 128000; //TODO: Should this be a UserConfig or be read from somewhere?
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createLoopTilingPass(cacheSizeBytes));
     if (userConfig_.explain_mlir_codegen)
         pm.addPass(
-            mlir::daphne::createPrintIRPass("IR after tiling pass"));
+            mlir::daphne::createPrintIRPass("IR after tiling pass")); */
 
     pm.addPass(mlir::daphne::createAggAllOpLoweringPass());
     pm.addPass(mlir::daphne::createMapOpLoweringPass());
@@ -320,7 +327,26 @@ void DaphneIrExecutor::buildCodegenPipeline(mlir::PassManager &pm) {
     //pm.addNestedPass<mlir::func::FuncOp>(mlir::createLoopFusionPass());
     pm.addNestedPass<mlir::func::FuncOp>(
         mlir::createAffineScalarReplacementPass());
+
+
+    /* pm.addNestedPass<mlir::func::FuncOp>(mlir::createForLoopSpecializationPass());
+    if (userConfig_.explain_mlir_codegen)
+        pm.addPass(
+            mlir::daphne::createPrintIRPass("IR after specialization pass"));
+    mlir::AffineVectorizeOptions affineVectorizeOptions;
+    affineVectorizeOptions.vectorSizes = {1,1};
+    pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineVectorize(affineVectorizeOptions));
+    if (userConfig_.explain_mlir_codegen)
+        pm.addPass(
+            mlir::daphne::createPrintIRPass("IR after vector pass")); */
     pm.addPass(mlir::createLowerAffinePass());
+   /*  mlir::LowerVectorToLLVMOptions lowerVectorToLLVMOptions;
+    lowerVectorToLLVMOptions.enableX86Vector(true);
+    pm.addPass(mlir::createConvertVectorToLLVMPass(lowerVectorToLLVMOptions));
+    if (userConfig_.explain_mlir_codegen)
+        pm.addPass(
+            mlir::daphne::createPrintIRPass("IR after vector lowering pass")); */
+    // TODO: Finish vectorizing
 
     if (userConfig_.explain_mlir_codegen)
         pm.addPass(
