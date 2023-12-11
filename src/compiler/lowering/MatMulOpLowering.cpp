@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <cstddef>
 #include <iostream>
 #include <memory>
 #include <utility>
@@ -25,6 +26,7 @@
 #include "ir/daphneir/Passes.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
@@ -36,14 +38,18 @@
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Dialect.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/UseDefLists.h"
 #include "mlir/Pass/Pass.h"
@@ -60,58 +66,51 @@ void affineMatMul(mlir::Value &lhs, mlir::Value &rhs, mlir::Value &output,
                   ConversionPatternRewriter &rewriter, mlir::Location loc,
                   ArrayRef<int64_t> lhsShape, ArrayRef<int64_t> rhsShape,
                   mlir::MLIRContext *ctx) {
-    SmallVector<Value, 4> loopIvs;
-
     // row loop
     auto rowLoop = rewriter.create<AffineForOp>(loc, 0, lhsShape[ROW], 1);
     for (Operation &nested : *rowLoop.getBody()) {
         rewriter.eraseOp(&nested);
     }
-
     // row loop body
     rewriter.setInsertionPointToStart(rowLoop.getBody());
-
     // fma loop
-    auto innerLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[ROW], 1);
-    for (Operation &nested : *innerLoop.getBody()) {
+    auto fmaLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[ROW], 1);
+    for (Operation &nested : *fmaLoop.getBody()) {
         rewriter.eraseOp(&nested);
     }
-    rewriter.setInsertionPointToStart(innerLoop.getBody());
-
+    // inner loop body
+    rewriter.setInsertionPointToStart(fmaLoop.getBody());
     // col loop
     auto colLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[COL], 1);
     for (Operation &nested : *colLoop.getBody()) {
         rewriter.eraseOp(&nested);
     }
-
     // col loop body
     rewriter.setInsertionPointToStart(colLoop.getBody());
 
-    loopIvs.push_back(rowLoop.getInductionVar());
-    loopIvs.push_back(colLoop.getInductionVar());
-    loopIvs.push_back(innerLoop.getInductionVar());
-
     // load
-    mlir::Value a = rewriter.create<memref::LoadOp>(
-        loc, lhs, ValueRange{loopIvs[0], loopIvs[2]});
-    mlir::Value b = rewriter.create<memref::LoadOp>(
-        loc, rhs, ValueRange{loopIvs[2], loopIvs[1]});
-    mlir::Value c = rewriter.create<memref::LoadOp>(
-        loc, output, ValueRange{loopIvs[0], loopIvs[1]});
+    mlir::Value a = rewriter.create<AffineLoadOp>(
+        loc, lhs, ValueRange{rowLoop.getInductionVar(), fmaLoop.getInductionVar()});
+    mlir::Value b = rewriter.create<AffineLoadOp>(
+        loc, rhs, ValueRange{fmaLoop.getInductionVar(), colLoop.getInductionVar()});
+    mlir::Value c = rewriter.create<AffineLoadOp>(
+        loc, output, ValueRange{rowLoop.getInductionVar(), colLoop.getInductionVar()});
 
     // fma
-    mlir::Value fma = rewriter.create<LLVM::FMAOp>(loc, a, b, c);
+    mlir::Value fma = rewriter.create<mlir::math::FmaOp>(loc, a, b, c);
+    //mlir::Value mult = rewriter.create<arith::MulFOp>(loc, a, b);
+    //mlir::Value fma = rewriter.create<arith::FoP>(loc, a, b, c);
+
 
     // store
-    rewriter.create<memref::StoreOp>(loc, fma, output,
-                                     ValueRange{loopIvs[0], loopIvs[1]});
+    rewriter.create<AffineStoreOp>(loc, fma, output,
+                                     ValueRange{rowLoop.getInductionVar(), colLoop.getInductionVar()});
 
     // AffineYieldOp at end of loop blocks
-    rewriter.setInsertionPointToEnd(rowLoop.getBody());
     rewriter.create<AffineYieldOp>(loc);
-    rewriter.setInsertionPointToEnd(colLoop.getBody());
+    rewriter.setInsertionPointAfter(colLoop);
     rewriter.create<AffineYieldOp>(loc);
-    rewriter.setInsertionPointToEnd(innerLoop.getBody());
+    rewriter.setInsertionPointAfter(fmaLoop);
     rewriter.create<AffineYieldOp>(loc);
     rewriter.setInsertionPointAfter(rowLoop);
 }
@@ -217,6 +216,7 @@ void MatMulLoweringPass::runOnOperation() {
     target.addLegalDialect<mlir::AffineDialect>();
     target.addLegalDialect<mlir::linalg::LinalgDialect>();
     target.addLegalDialect<mlir::LLVM::LLVMDialect>();
+    target.addLegalDialect<mlir::math::MathDialect>();
 
     target.addLegalOp<mlir::daphne::ConvertDenseMatrixToMemRef>();
     target.addLegalOp<mlir::daphne::ConvertMemRefToDenseMatrix>();
