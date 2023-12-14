@@ -308,7 +308,11 @@ void DaphneIrExecutor::buildCodegenPipeline(mlir::PassManager &pm) {
                  mlir::daphne::createPrintIRPass("IR after MatMulOp lowering Pass"));
     }
     
-
+    pm.addNestedPass<mlir::func::FuncOp>(
+        mlir::createAffineLoopInvariantCodeMotionPass());
+    if (userConfig_.explain_mlir_codegen)
+        pm.addPass(
+                mlir::daphne::createPrintIRPass("IR after Affine Loop Invariant Code Motion Pass"));
     /* uint64_t cacheSizeBytes = 128000; //TODO: Should this be a UserConfig or be read from somewhere?
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createLoopTilingPass(cacheSizeBytes));
     if (userConfig_.explain_mlir_codegen)
@@ -334,18 +338,18 @@ void DaphneIrExecutor::buildCodegenPipeline(mlir::PassManager &pm) {
         pm.addPass(
             mlir::daphne::createPrintIRPass("IR after specialization pass"));
     mlir::AffineVectorizeOptions affineVectorizeOptions;
-    affineVectorizeOptions.vectorSizes = {1,1};
+    affineVectorizeOptions.vectorSizes = {4};
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineVectorize(affineVectorizeOptions));
     if (userConfig_.explain_mlir_codegen)
         pm.addPass(
             mlir::daphne::createPrintIRPass("IR after vector pass")); */
     pm.addPass(mlir::createLowerAffinePass());
-   /*  mlir::LowerVectorToLLVMOptions lowerVectorToLLVMOptions;
+    mlir::LowerVectorToLLVMOptions lowerVectorToLLVMOptions;
     lowerVectorToLLVMOptions.enableX86Vector(true);
     pm.addPass(mlir::createConvertVectorToLLVMPass(lowerVectorToLLVMOptions));
     if (userConfig_.explain_mlir_codegen)
         pm.addPass(
-            mlir::daphne::createPrintIRPass("IR after vector lowering pass")); */
+            mlir::daphne::createPrintIRPass("IR after vector lowering pass"));
     // TODO: Finish vectorizing
 
     if (userConfig_.explain_mlir_codegen)
