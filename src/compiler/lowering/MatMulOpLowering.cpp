@@ -44,6 +44,8 @@
 #include "mlir/Conversion/LinalgToStandard/LinalgToStandard.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
+#include "mlir/Dialect/Affine/Analysis/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/LoopFusionUtils.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
@@ -56,11 +58,13 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Vector/TransformOps/VectorTransformOps.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
+#include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/UseDefLists.h"
 #include "mlir/IR/ValueRange.h"
@@ -211,7 +215,7 @@ class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
             mlir::MemRefType::get({lhsRows, lhsCols}, matrixElementType);
         auto rhsMemRefType =
             mlir::MemRefType::get({rhsRows, rhsCols}, matrixElementType);
-
+        
         mlir::MemRefType outputMemRefType =
             mlir::MemRefType::get({lhsRows, rhsCols}, matrixElementType);
 
@@ -236,60 +240,42 @@ class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
                      op->getContext());
         
         llvm::SmallVector<AffineForOp> loopNest;
+        DenseSet<Operation*> loopSet;
         getPerfectlyNestedLoops2(loopNest, loops.front());
-        /* llvm::SmallVector<AffineForOp> loopNest3;
-        getPerfectlyNestedLoops2(loopNest3, loops.back());
-        llvm::SmallVector<AffineForOp> loopNest2;
-        loops.pop_back();
-        getPerfectlyNestedLoops2(loopNest2, loops.back());
-        std::cout << "Outer loop: " << isPerfectlyNested(loopNest)  << loopNest.size() << std::endl;
-        std::cout << "FMA loop: " << isPerfectlyNested(loopNest2)  << loopNest2.size() << std::endl;
-        std::cout << "Inner Loop : " << isPerfectlyNested(loopNest3)  << loopNest3.size() << std::endl; */
+        // for (auto o : loopNest) {
+        //     if (isLoopParallel(o) && isLoopMemoryParallel(o)){
+        //         if (failed(affineParallelize(o))){
+        //             std::cout << "Affine Parallelization failed" << std::endl;
+        //         }
+        //     }else {
+        //         std::cout << "This is not a parallel loop." << std::endl;
+        //     }
+        //     loopSet.insert(o.getOperation());
+        // }
+        // This vectorization attempt doesn't seem to do much
+        //vectorizeAffineLoops(op, loopSet, {4}, {});
+        VectorizationStrategy vectorizationStrategy;
+        vectorizationStrategy.vectorSizes = {4};
+        std::vector<SmallVector<AffineForOp, 2>> loopVectorVector = {{loopNest.back()}};
+        //loopVectorVector.push_back({loopNest.back()});
+        if (failed(vectorizeAffineLoopNest(loopVectorVector, vectorizationStrategy))){
+            std::cout << "Affine Parallelization failed" << std::endl;
+        }else {
+                std::cout << "This is not a parallel loop." << std::endl;
+        }
         
         /* if (failed(tilePerfectlyNested(loopNest, {4, 8}))){
             std::cout << "Tiling the loops failed" << std::endl;
         }; */
         llvm::SmallVector<AffineForOp> tiledNest;
-        if (failed(tilePerfectlyNested(loopNest, {12, 12, 12}, &loopNest))) {
+        if (failed(tilePerfectlyNested(loopNest, {12, 12, 12}, &tiledNest))) {
             std::cout << "Failed to tile the Loop nest" << std::endl;
         };
         // llvm::SmallVector<AffineForOp> fullTileNest;
         // if (failed(separateFullTiles(tiledNest, &fullTileNest))){
         //     std::cout << "Failed to separate full tiles" << std::endl;
-        // };        
-
-        // llvm::SmallVector<AffineForOp> loopNest4;
+        // };                
         
-        // getPerfectlyNestedLoops2(loopNest4, tiledNest.front());
-        // std::cout << "After tiling loop: " << isPerfectlyNested(loopNest4)  << loopNest4.size() << std::endl;
-        // llvm::DenseSet<Operation*, DenseMapInfo<Operation*>> loopSet;
-        // loopSet.insert(loopNest4.back());   
-        // vectorizeAffineLoops(loopNest4.front()->getParentOp(), loopSet, {1}, {});
-
-        // std::vector<SmallVector<AffineForOp, 2>> loopVector = {{loopNest4.back()}};//{{loopNest4.front()}};
-        //     if (loopVector.empty() || loopVector[0].size() != 1)
-        //         std::cout << "loopVector not the right candidate" << std::endl;
-        //     else {
-        //         std::cout << "loopVector has the correct form" << std::endl;
-        //     };
-        //     //We vectorize the outermost loop found with VF=4.
-        //     AffineForOp outermostLoop = loopVector[0][0];
-        //     VectorizationStrategy strategy;
-        //     strategy.vectorSizes.push_back(1 /*vectorization factor*/);
-        //     strategy.loopToVectorDim[outermostLoop] = 0;
-        //     std::vector<SmallVector<AffineForOp, 2>> loopsToVectorize;
-        //     loopsToVectorize.push_back({outermostLoop});
-        //     std::cout << "We are about to vectorize " << std::endl;
-        //     if (failed(verifyLoopNesting2(loopsToVectorize))){
-        //         std::cout << "Didnt prepare loopsToVectorize correctly" << std::endl;
-        //     }
-        //     else {
-        //         std::cout << "Prepared loopsToVectorize alright" << std::endl;
-        //     }
-        //     if (failed(vectorizeAffineLoopNest(loopsToVectorize, strategy))){
-        //         std::cout << "Failed to vectorize LoopNest" << std::endl;
-        //     };
-    
         mlir::Value DM = convertMemRefToDenseMatrix(loc, rewriter, outputMemRef,
                                                     op.getType());
         std::cout << "Converted back to Dense Matrix" << std::endl;
@@ -350,7 +336,6 @@ void MatMulLoweringPass::runOnOperation() {
     target.addIllegalOp<mlir::daphne::MatMulOp>();
 
     patterns.insert<MatMulLowering>(&getContext());
-    
     auto module = getOperation();
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
         signalPassFailure();

@@ -333,7 +333,7 @@ void DaphneIrExecutor::buildCodegenPipeline(mlir::PassManager &pm) {
         mlir::createAffineScalarReplacementPass());
 
 
-    pm.addNestedPass<mlir::func::FuncOp>(mlir::createForLoopSpecializationPass());
+    /* pm.addNestedPass<mlir::func::FuncOp>(mlir::createForLoopSpecializationPass());
     if (userConfig_.explain_mlir_codegen)
         pm.addPass(
             mlir::daphne::createPrintIRPass("IR after specialization pass"));
@@ -342,7 +342,7 @@ void DaphneIrExecutor::buildCodegenPipeline(mlir::PassManager &pm) {
     pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineVectorize(affineVectorizeOptions));
     if (userConfig_.explain_mlir_codegen)
         pm.addPass(
-            mlir::daphne::createPrintIRPass("IR after vector pass"));
+            mlir::daphne::createPrintIRPass("IR after vector pass")); */
     pm.addPass(mlir::createLowerAffinePass());
     mlir::LowerVectorToLLVMOptions lowerVectorToLLVMOptions;
     lowerVectorToLLVMOptions.enableX86Vector(true);
