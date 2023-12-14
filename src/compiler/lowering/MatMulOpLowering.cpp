@@ -63,11 +63,13 @@
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/UseDefLists.h"
+#include "mlir/IR/ValueRange.h"
 #include "mlir/IR/Visitors.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 using namespace mlir;
 
@@ -77,38 +79,34 @@ static constexpr int COL = 1;
 llvm::SmallVector<AffineForOp, 3> affineMatMul(mlir::Value &lhs, mlir::Value &rhs, mlir::Value &output,
                   ConversionPatternRewriter &rewriter, mlir::Location loc,
                   ArrayRef<int64_t> lhsShape, ArrayRef<int64_t> rhsShape,
-                  Type elementType, mlir::MLIRContext *ctx) {
-    int vec_size = 1;
+                  mlir::MLIRContext *ctx) {
     llvm::SmallVector<AffineForOp, 3> loops;
     
     // row loop
-    auto rowLoop = rewriter.create<AffineForOp>(loc, 0, lhsShape[ROW] + 1 - vec_size, 1);
+    auto rowLoop = rewriter.create<AffineForOp>(loc, 0, lhsShape[ROW], 1);
     // row loop body
     rewriter.setInsertionPointToStart(rowLoop.getBody());
     // fma loop
-    auto fmaLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[ROW] + 1 - vec_size, 1);
+    auto fmaLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[ROW], 1);
     // inner loop body
     rewriter.setInsertionPointToStart(fmaLoop.getBody());
     // col loop
-    auto colLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[COL] + 1 - vec_size, 1);
+    auto colLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[COL], 1);
     // col loop body
     rewriter.setInsertionPointToStart(colLoop.getBody());
 
-    //TODO: deal with last columns being cut off
-        auto vecType = mlir::VectorType::get({vec_size}, elementType);
-        auto a_single = rewriter.create<AffineLoadOp>(loc, lhs, 
-                                                    ValueRange{rowLoop.getInductionVar(), fmaLoop.getInductionVar()});
-        auto  a = rewriter.create<vector::SplatOp>(loc, a_single, vecType);
-        auto  b = rewriter.create<AffineVectorLoadOp>(
-                   loc, vecType, rhs,
+        auto  a = rewriter.create<AffineLoadOp>(loc, lhs,
+                    ValueRange{rowLoop.getInductionVar(), fmaLoop.getInductionVar()});
+        auto  b = rewriter.create<AffineLoadOp>(
+                   loc, rhs,
                     ValueRange{fmaLoop.getInductionVar(), colLoop.getInductionVar()});
-        auto  c = rewriter.create<AffineVectorLoadOp>(
-                    loc, vecType, output,
+        auto  c = rewriter.create<AffineLoadOp>(
+                    loc, output,
                     ValueRange{rowLoop.getInductionVar(), colLoop.getInductionVar()});
         
         Value res = rewriter.create<math::FmaOp>(loc, a, b, c);
        
-        rewriter.create<AffineVectorStoreOp>(loc, res, output,
+        rewriter.create<AffineStoreOp>(loc, res, output,
                                            ValueRange{rowLoop.getInductionVar(), colLoop.getInductionVar()});
 
     
@@ -235,7 +233,7 @@ class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
         // Do the actual MatMul with hand built codegen
         auto loops = affineMatMul(lhs, rhs, outputMemRef, rewriter, loc,
                      lhsMemRefType.getShape(), rhsMemRefType.getShape(),
-                     matrixElementType, op->getContext());
+                     op->getContext());
         
         llvm::SmallVector<AffineForOp> loopNest;
         getPerfectlyNestedLoops2(loopNest, loops.front());
@@ -255,12 +253,12 @@ class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
         if (failed(tilePerfectlyNested(loopNest, {12, 12, 12}, &loopNest))) {
             std::cout << "Failed to tile the Loop nest" << std::endl;
         };
-        llvm::SmallVector<AffineForOp> fullTileNest;
-        if (failed(separateFullTiles(tiledNest, &fullTileNest))){
-            std::cout << "Failed to separate full tiles" << std::endl;
-        };        
+        // llvm::SmallVector<AffineForOp> fullTileNest;
+        // if (failed(separateFullTiles(tiledNest, &fullTileNest))){
+        //     std::cout << "Failed to separate full tiles" << std::endl;
+        // };        
 
-        llvm::SmallVector<AffineForOp> loopNest4;
+        // llvm::SmallVector<AffineForOp> loopNest4;
         
         // getPerfectlyNestedLoops2(loopNest4, tiledNest.front());
         // std::cout << "After tiling loop: " << isPerfectlyNested(loopNest4)  << loopNest4.size() << std::endl;
@@ -291,7 +289,7 @@ class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
         //     if (failed(vectorizeAffineLoopNest(loopsToVectorize, strategy))){
         //         std::cout << "Failed to vectorize LoopNest" << std::endl;
         //     };
-
+    
         mlir::Value DM = convertMemRefToDenseMatrix(loc, rewriter, outputMemRef,
                                                     op.getType());
         std::cout << "Converted back to Dense Matrix" << std::endl;
@@ -352,12 +350,13 @@ void MatMulLoweringPass::runOnOperation() {
     target.addIllegalOp<mlir::daphne::MatMulOp>();
 
     patterns.insert<MatMulLowering>(&getContext());
-    //populateAffineToVectorConversionPatterns(patterns);
+    
     auto module = getOperation();
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
         signalPassFailure();
     }
     std::cout << "Finished the MatMulLoweringPass inside" << std::endl;
+    
 }
 
 std::unique_ptr<mlir::Pass> mlir::daphne::createMatMulOpLoweringPass() {
