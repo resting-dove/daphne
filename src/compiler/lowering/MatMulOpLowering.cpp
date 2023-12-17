@@ -96,7 +96,7 @@ llvm::SmallVector<AffineForOp, 3> affineMatMul(mlir::Value &lhs, mlir::Value &rh
     // inner loop body
     rewriter.setInsertionPointToStart(fmaLoop.getBody());
     // col loop
-    auto colLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[COL], vec_size);
+    auto colLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[COL], 1);
     // col loop body
     rewriter.setInsertionPointToStart(colLoop.getBody());
 
