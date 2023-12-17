@@ -52,10 +52,12 @@
 #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinDialect.h"
@@ -68,6 +70,7 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 using namespace mlir;
 
@@ -82,15 +85,15 @@ llvm::SmallVector<AffineForOp, 3> affineMatMul(mlir::Value &lhs, mlir::Value &rh
     llvm::SmallVector<AffineForOp, 3> loops;
     
     // row loop
-    auto rowLoop = rewriter.create<AffineForOp>(loc, 0, lhsShape[ROW] + 1 - vec_size, 1);
+    auto rowLoop = rewriter.create<AffineForOp>(loc, 0, lhsShape[ROW], 1);
     // row loop body
     rewriter.setInsertionPointToStart(rowLoop.getBody());
     // fma loop
-    auto fmaLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[ROW] + 1 - vec_size, 1);
+    auto fmaLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[ROW], 1);
     // inner loop body
     rewriter.setInsertionPointToStart(fmaLoop.getBody());
     // col loop
-    auto colLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[COL] + 1 - vec_size, 1);
+    auto colLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[COL], vec_size);
     // col loop body
     rewriter.setInsertionPointToStart(colLoop.getBody());
 
@@ -239,58 +242,13 @@ class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
         
         llvm::SmallVector<AffineForOp> loopNest;
         getPerfectlyNestedLoops2(loopNest, loops.front());
-        /* llvm::SmallVector<AffineForOp> loopNest3;
-        getPerfectlyNestedLoops2(loopNest3, loops.back());
-        llvm::SmallVector<AffineForOp> loopNest2;
-        loops.pop_back();
-        getPerfectlyNestedLoops2(loopNest2, loops.back());
-        std::cout << "Outer loop: " << isPerfectlyNested(loopNest)  << loopNest.size() << std::endl;
-        std::cout << "FMA loop: " << isPerfectlyNested(loopNest2)  << loopNest2.size() << std::endl;
-        std::cout << "Inner Loop : " << isPerfectlyNested(loopNest3)  << loopNest3.size() << std::endl; */
-        
-        /* if (failed(tilePerfectlyNested(loopNest, {4, 8}))){
-            std::cout << "Tiling the loops failed" << std::endl;
-        }; */
+
         llvm::SmallVector<AffineForOp> tiledNest;
         if (failed(tilePerfectlyNested(loopNest, {12, 12, 12}, &loopNest))) {
             std::cout << "Failed to tile the Loop nest" << std::endl;
-        };
-        llvm::SmallVector<AffineForOp> fullTileNest;
-        if (failed(separateFullTiles(tiledNest, &fullTileNest))){
-            std::cout << "Failed to separate full tiles" << std::endl;
-        };        
+        };       
 
         llvm::SmallVector<AffineForOp> loopNest4;
-        
-        // getPerfectlyNestedLoops2(loopNest4, tiledNest.front());
-        // std::cout << "After tiling loop: " << isPerfectlyNested(loopNest4)  << loopNest4.size() << std::endl;
-        // llvm::DenseSet<Operation*, DenseMapInfo<Operation*>> loopSet;
-        // loopSet.insert(loopNest4.back());   
-        // vectorizeAffineLoops(loopNest4.front()->getParentOp(), loopSet, {1}, {});
-
-        // std::vector<SmallVector<AffineForOp, 2>> loopVector = {{loopNest4.back()}};//{{loopNest4.front()}};
-        //     if (loopVector.empty() || loopVector[0].size() != 1)
-        //         std::cout << "loopVector not the right candidate" << std::endl;
-        //     else {
-        //         std::cout << "loopVector has the correct form" << std::endl;
-        //     };
-        //     //We vectorize the outermost loop found with VF=4.
-        //     AffineForOp outermostLoop = loopVector[0][0];
-        //     VectorizationStrategy strategy;
-        //     strategy.vectorSizes.push_back(1 /*vectorization factor*/);
-        //     strategy.loopToVectorDim[outermostLoop] = 0;
-        //     std::vector<SmallVector<AffineForOp, 2>> loopsToVectorize;
-        //     loopsToVectorize.push_back({outermostLoop});
-        //     std::cout << "We are about to vectorize " << std::endl;
-        //     if (failed(verifyLoopNesting2(loopsToVectorize))){
-        //         std::cout << "Didnt prepare loopsToVectorize correctly" << std::endl;
-        //     }
-        //     else {
-        //         std::cout << "Prepared loopsToVectorize alright" << std::endl;
-        //     }
-        //     if (failed(vectorizeAffineLoopNest(loopsToVectorize, strategy))){
-        //         std::cout << "Failed to vectorize LoopNest" << std::endl;
-        //     };
 
         mlir::Value DM = convertMemRefToDenseMatrix(loc, rewriter, outputMemRef,
                                                     op.getType());
@@ -331,33 +289,62 @@ struct MatMulLoweringPass
 }  // end anonymous namespace
 
 void MatMulLoweringPass::runOnOperation() {
-    mlir::ConversionTarget target(getContext());
-    mlir::RewritePatternSet patterns(&getContext());
-    LowerToLLVMOptions llvmOptions(&getContext());
-    LLVMTypeConverter typeConverter(&getContext(), llvmOptions);
-
-    target.addLegalDialect<mlir::memref::MemRefDialect>();
-    target.addLegalDialect<mlir::arith::ArithDialect>();
-    target.addLegalDialect<mlir::scf::SCFDialect>();
-    target.addLegalDialect<mlir::AffineDialect>();
-    target.addLegalDialect<mlir::linalg::LinalgDialect>();
-    target.addLegalDialect<mlir::LLVM::LLVMDialect>();
-    target.addLegalDialect<mlir::math::MathDialect>();
-    target.addLegalDialect<mlir::vector::VectorDialect>();
-
-    target.addLegalOp<mlir::daphne::ConvertDenseMatrixToMemRef>();
-    target.addLegalOp<mlir::daphne::ConvertMemRefToDenseMatrix>();
-    target.addLegalOp<mlir::daphne::DecRefOp>();
-
-    target.addIllegalOp<mlir::daphne::MatMulOp>();
-
-    patterns.insert<MatMulLowering>(&getContext());
-    //populateAffineToVectorConversionPatterns(patterns);
     auto module = getOperation();
-    if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
-        signalPassFailure();
+    {
+        mlir::ConversionTarget target(getContext());
+        mlir::RewritePatternSet patterns(&getContext());
+        LowerToLLVMOptions llvmOptions(&getContext());
+        LLVMTypeConverter typeConverter(&getContext(), llvmOptions);
+
+        target.addLegalDialect<mlir::memref::MemRefDialect>();
+        target.addLegalDialect<mlir::arith::ArithDialect>();
+        target.addLegalDialect<mlir::scf::SCFDialect>();
+        target.addLegalDialect<mlir::AffineDialect>();
+        target.addLegalDialect<mlir::linalg::LinalgDialect>();
+        target.addLegalDialect<mlir::LLVM::LLVMDialect>();
+        target.addLegalDialect<mlir::math::MathDialect>();
+        target.addLegalDialect<mlir::vector::VectorDialect>();
+
+        target.addLegalOp<mlir::daphne::ConvertDenseMatrixToMemRef>();
+        target.addLegalOp<mlir::daphne::ConvertMemRefToDenseMatrix>();
+        target.addLegalOp<mlir::daphne::DecRefOp>();
+
+        target.addIllegalOp<mlir::daphne::MatMulOp>();
+
+        patterns.insert<MatMulLowering>(&getContext());
+        
+        if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
+            signalPassFailure();
+        }
+        else {
+        std::cout << "Finished the MatMulLoweringPass inside" << std::endl;
+        }
     }
-    std::cout << "Finished the MatMulLoweringPass inside" << std::endl;
+    {
+        mlir::ConversionTarget target(getContext());
+        mlir::RewritePatternSet patterns(&getContext());
+        LowerToLLVMOptions llvmOptions(&getContext());
+        LLVMTypeConverter typeConverter(&getContext(), llvmOptions);
+
+        target.addLegalDialect<mlir::memref::MemRefDialect>();
+        target.addLegalDialect<mlir::arith::ArithDialect>();
+        target.addLegalDialect<mlir::scf::SCFDialect>();
+        target.addLegalDialect<mlir::AffineDialect>();
+        target.addLegalDialect<mlir::linalg::LinalgDialect>();
+        target.addLegalDialect<mlir::LLVM::LLVMDialect>();
+        target.addLegalDialect<mlir::math::MathDialect>();
+        target.addLegalDialect<mlir::vector::VectorDialect>();
+
+        target.addLegalOp<mlir::daphne::ConvertDenseMatrixToMemRef>();
+        target.addLegalOp<mlir::daphne::ConvertMemRefToDenseMatrix>();
+        target.addLegalOp<mlir::daphne::DecRefOp>();
+        populateAffineToVectorConversionPatterns(patterns);
+        if (failed(applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+            signalPassFailure();
+        }else{
+            std::cout << "Finished the Greedy folding inside" << std::endl;
+        }
+    }
 }
 
 std::unique_ptr<mlir::Pass> mlir::daphne::createMatMulOpLoweringPass() {
