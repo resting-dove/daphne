@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <cassert>
 #include <cstddef>
 #include <iostream>
 #include <iterator>
@@ -91,15 +92,15 @@ llvm::SmallVector<AffineForOp, 3> affineMatMul(mlir::Value &lhs, mlir::Value &rh
     auto rowLoop = rewriter.create<AffineForOp>(loc, 0, lhsShape[ROW], 1);
     // row loop body
     rewriter.setInsertionPointToStart(rowLoop.getBody());
-    // fma loop
-    auto fmaLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[ROW], 1);
-    // inner loop body
-    rewriter.setInsertionPointToStart(fmaLoop.getBody());
     // col loop
     auto colLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[COL], 1);
     // col loop body
     rewriter.setInsertionPointToStart(colLoop.getBody());
-
+    // fma loop
+    auto fmaLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[ROW], 1);
+    // inner loop body
+    rewriter.setInsertionPointToStart(fmaLoop.getBody());
+    
         auto  a = rewriter.create<AffineLoadOp>(loc, lhs,
                     ValueRange{rowLoop.getInductionVar(), fmaLoop.getInductionVar()});
         auto  b = rewriter.create<AffineLoadOp>(
@@ -116,8 +117,8 @@ llvm::SmallVector<AffineForOp, 3> affineMatMul(mlir::Value &lhs, mlir::Value &rh
 
     
     // AffineYieldOp at end of loop blocks
-    rewriter.setInsertionPointAfter(colLoop);
     rewriter.setInsertionPointAfter(fmaLoop);
+    rewriter.setInsertionPointAfter(colLoop);
     rewriter.setInsertionPointAfter(rowLoop);
 
     loops.push_back(rowLoop);
@@ -128,6 +129,7 @@ llvm::SmallVector<AffineForOp, 3> affineMatMul(mlir::Value &lhs, mlir::Value &rh
 
 void getPerfectlyNestedLoops2(SmallVectorImpl<AffineForOp> &nestedLoops,
                                    AffineForOp root) {
+                                    nestedLoops.clear();
   for (unsigned i = 0; i < std::numeric_limits<unsigned>::max(); ++i) {
     nestedLoops.push_back(root);
     Block &body = root.getRegion().front();
@@ -239,17 +241,28 @@ class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
         auto loops = affineMatMul(lhs, rhs, outputMemRef, rewriter, loc,
                      lhsMemRefType.getShape(), rhsMemRefType.getShape(),
                      op->getContext());
-        
+        unsigned MC = 64;
+        unsigned KC = 256;
+        unsigned NR = 4;
+        unsigned MR = 4;
         llvm::SmallVector<AffineForOp> loopNest;
-        DenseSet<Operation*> loopSet;
         getPerfectlyNestedLoops2(loopNest, loops.front());
-
+        // tile i with MC, j with NR, k with KC
         llvm::SmallVector<AffineForOp> tiledNest;
-        if (failed(tilePerfectlyNested(loopNest, {12, 12, 12}, &tiledNest))) {
+        if (failed(tilePerfectlyNested(loopNest, {MC, NR, KC}, &tiledNest))) {
             std::cout << "Failed to tile the Loop nest" << std::endl;
-        };       
-
-        llvm::SmallVector<AffineForOp> loopNest4;
+        };
+        // Further tile the i mod MC loop with MR
+        assert(tiledNest[0] == tiledNest[3]->getParentOp());
+        if (failed(tilePerfectlyNested(tiledNest[3], {MR}))) {
+            std::cout << "Failed to tile the second Loop nest" << std::endl;
+        };
+        llvm::SmallVector<AffineForOp> twiceTiledNest;
+        getPerfectlyNestedLoops2(twiceTiledNest, tiledNest[0]);
+        // permute loops to final order (i / MC, j / NR, k / KC, i / MR, i mod MR, k mod KC, j mod NR) ->
+        // (k / KC, i / MC, j / NR, i / MR, k mod KC, j mod NR, i mod MR)
+        assert(isValidLoopInterchangePermutation(twiceTiledNest, {1, 2, 0, 3, 6, 4, 5}));
+        unsigned root_idx = permuteLoops(twiceTiledNest, {1, 2, 0, 3, 6, 4, 5});
 
         mlir::Value DM = convertMemRefToDenseMatrix(loc, rewriter, outputMemRef,
                                                     op.getType());
@@ -315,6 +328,7 @@ void MatMulLoweringPass::runOnOperation() {
         patterns.insert<MatMulLowering>(&getContext());
         
         if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
+            module->dump();
             signalPassFailure();
         }
         else {
