@@ -283,10 +283,17 @@ class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
         assert(isValidLoopInterchangePermutation(twiceTiledNest, {2, 0, 1, 4, 7, 3, 6, 5}));
         unsigned root_idx = permuteLoops(twiceTiledNest, {2, 0, 1, 4, 7, 3, 6, 5});
 
-
+        // Unroll and jam
         llvm::SmallVector<AffineForOp> blisTiledLoops;
         getPerfectlyNestedLoops2(blisTiledLoops, twiceTiledNest[root_idx]); 
+        if (failed(loopUnrollJamByFactor(blisTiledLoops[7], MR))) {
+            std::cout << "Could not unroll the last loop" << std::endl;
+        }
+        if (failed(loopUnrollJamByFactor(blisTiledLoops[6], NR))) {
+            std::cout << "Could not unroll the second to last loop" << std::endl;
+        }
 
+        
         mlir::Value DM = convertMemRefToDenseMatrix(loc, rewriter, outputMemRef,
                                                     op.getType());
         std::cout << "Converted back to Dense Matrix" << std::endl;
