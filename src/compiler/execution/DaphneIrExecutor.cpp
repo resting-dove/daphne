@@ -306,6 +306,9 @@ void DaphneIrExecutor::buildCodegenPipeline(mlir::PassManager &pm) {
         if (userConfig_.explain_mlir_codegen)
             pm.addPass(
                  mlir::daphne::createPrintIRPass("IR after MatMulOp lowering Pass"));
+        pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineLoopNormalizePass());
+        pm.addNestedPass<mlir::func::FuncOp>(mlir::createAffineScalarReplacementPass());
+
     }
     
     pm.addNestedPass<mlir::func::FuncOp>(
@@ -313,11 +316,6 @@ void DaphneIrExecutor::buildCodegenPipeline(mlir::PassManager &pm) {
     if (userConfig_.explain_mlir_codegen)
         pm.addPass(
                 mlir::daphne::createPrintIRPass("IR after Affine Loop Invariant Code Motion Pass"));
-    /* uint64_t cacheSizeBytes = 128000; //TODO: Should this be a UserConfig or be read from somewhere?
-    pm.addNestedPass<mlir::func::FuncOp>(mlir::createLoopTilingPass(cacheSizeBytes));
-    if (userConfig_.explain_mlir_codegen)
-        pm.addPass(
-            mlir::daphne::createPrintIRPass("IR after tiling pass")); */
 
     pm.addPass(mlir::daphne::createAggAllOpLoweringPass());
     pm.addPass(mlir::daphne::createMapOpLoweringPass());

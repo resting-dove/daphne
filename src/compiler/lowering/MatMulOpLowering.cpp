@@ -33,6 +33,7 @@
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Support/raw_os_ostream.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
@@ -57,6 +58,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -66,6 +68,7 @@
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/UseDefLists.h"
@@ -246,6 +249,7 @@ class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
         unsigned NC = 512;
         unsigned NR = 4;
         unsigned MR = 4;
+        unsigned KU = 4;
         llvm::SmallVector<AffineForOp> loopNest;
         getPerfectlyNestedLoops2(loopNest, loops.front());
         // tile i with MC, j with NC, k with KC
@@ -292,7 +296,9 @@ class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
         if (failed(loopUnrollJamByFactor(blisTiledLoops[6], NR))) {
             std::cout << "Could not unroll the second to last loop" << std::endl;
         }
-
+        if (failed(loopUnrollUpToFactor(blisTiledLoops[5], KU))) {
+            std::cout << "Could not unroll the K loop" << std::endl;
+        }
         
         mlir::Value DM = convertMemRefToDenseMatrix(loc, rewriter, outputMemRef,
                                                     op.getType());
@@ -383,6 +389,7 @@ void MatMulLoweringPass::runOnOperation() {
         target.addLegalOp<mlir::daphne::ConvertDenseMatrixToMemRef>();
         target.addLegalOp<mlir::daphne::ConvertMemRefToDenseMatrix>();
         target.addLegalOp<mlir::daphne::DecRefOp>();
+        
         populateAffineToVectorConversionPatterns(patterns);
         if (failed(applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
             signalPassFailure();
