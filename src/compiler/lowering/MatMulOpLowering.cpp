@@ -243,26 +243,55 @@ class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
                      op->getContext());
         unsigned MC = 64;
         unsigned KC = 256;
-        unsigned NR = 4;
+        unsigned NC = 512;
+        unsigned NR = 5;
         unsigned MR = 4;
         llvm::SmallVector<AffineForOp> loopNest;
         getPerfectlyNestedLoops2(loopNest, loops.front());
-        // tile i with MC, j with NR, k with KC
+        // tile i with MC, j with NC, k with KC
         llvm::SmallVector<AffineForOp> tiledNest;
-        if (failed(tilePerfectlyNested(loopNest, {MC, NR, KC}, &tiledNest))) {
+        if (failed(tilePerfectlyNested(loopNest, {MC, NC, KC}, &tiledNest))) {
             std::cout << "Failed to tile the Loop nest" << std::endl;
         };
         // Further tile the i mod MC loop with MR
         assert(tiledNest[0] == tiledNest[3]->getParentOp());
+        assert(tiledNest[1] == tiledNest[4]->getParentOp());
         if (failed(tilePerfectlyNested(tiledNest[3], {MR}))) {
             std::cout << "Failed to tile the second Loop nest" << std::endl;
         };
+        
+        // Further tile the j mod NC loop with NR
+        //llvm::SmallVector<AffineForOp> toTile;
+        assert(tiledNest[1] == tiledNest[4]->getParentOp());
+        //getPerfectlyNestedLoops2(toTtile, tiledNest[4]);
+        if (failed(tilePerfectlyNested(tiledNest[4], {NR}))) {
+            std::cout << "Failed to tile the second j Loop" << std::endl;
+        };
         llvm::SmallVector<AffineForOp> twiceTiledNest;
         getPerfectlyNestedLoops2(twiceTiledNest, tiledNest[0]);
-        // permute loops to final order (i / MC, j / NR, k / KC, i / MR, i mod MR, k mod KC, j mod NR) ->
-        // (k / KC, i / MC, j / NR, i / MR, k mod KC, j mod NR, i mod MR)
-        assert(isValidLoopInterchangePermutation(twiceTiledNest, {1, 2, 0, 3, 6, 4, 5}));
-        unsigned root_idx = permuteLoops(twiceTiledNest, {1, 2, 0, 3, 6, 4, 5});
+        assert(twiceTiledNest[0].getStep() == MC);
+        assert(twiceTiledNest[3].getStep() == MR);
+        assert(twiceTiledNest[4].getStep() == 1);
+        assert(twiceTiledNest[1].getStep() == NC);
+        assert(twiceTiledNest[5].getStep() == NR);
+        assert(twiceTiledNest[7].getStep() == 1);
+        std::cout << "The step size of what I think are the i loops should be 64, 4, 1 are " << twiceTiledNest[0].getStep() << ", " << twiceTiledNest[3].getStep() << ", " << twiceTiledNest[4].getStep() << std::endl;
+        std::cout << "The step size of what I think are the j loops should be 512, 5, 1 are " << twiceTiledNest[1].getStep() << ", " << twiceTiledNest[5].getStep() << ", " << twiceTiledNest[6].getStep() << std::endl;
+        std::cout << "The step size of what I think are the k loops should be 256, 1 are " << twiceTiledNest[2].getStep() << ", " << twiceTiledNest[7].getStep() << std::endl;
+        std::cout << " Expect to have 8 loops and have " << twiceTiledNest.size() << std::endl;
+                                    //  (i / MC, j / NC, k / KC, i / MR, i mod MR, j / NR, j mod NR, k mod KC)
+        // permute loops to final order (i / MC, j / NC, k / KC, i / MR, j / NR, i mod MR, j mod NR, k mod KC) ->
+        //                              (j / NC, k / KC, i / MC, j / NR, i / MR, k mod KC, j mod NR, i mod MR)
+        assert(isValidLoopInterchangePermutation(twiceTiledNest, {2, 0, 1, 4, 7, 3, 6, 5}));
+        unsigned root_idx = permuteLoops(twiceTiledNest, {2, 0, 1, 4, 7, 3, 6, 5});
+
+
+        llvm::SmallVector<AffineForOp> blisTiledLoops;
+        getPerfectlyNestedLoops2(blisTiledLoops, twiceTiledNest[root_idx]); 
+        
+
+        // Unroll and Jam
+        //loopUnrollJamUpToFactor(twiceTiledNest[5], 4);
 
         mlir::Value DM = convertMemRefToDenseMatrix(loc, rewriter, outputMemRef,
                                                     op.getType());
