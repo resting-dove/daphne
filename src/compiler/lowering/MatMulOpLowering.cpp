@@ -19,6 +19,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <numeric>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -33,6 +34,8 @@
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/iterator.h"
+#include "llvm/ADT/iterator_range.h"
 #include "llvm/Support/raw_os_ostream.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
@@ -66,9 +69,11 @@
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
+#include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/UseDefLists.h"
+#include "mlir/IR/Value.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/IR/Visitors.h"
 #include "mlir/Pass/Pass.h"
@@ -76,6 +81,7 @@
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "parser/ParserUtils.h"
 
 using namespace mlir;
 
@@ -241,51 +247,6 @@ class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
         auto loops = affineMatMul(lhs, rhs, outputMemRef, rewriter, loc,
                      lhsMemRefType.getShape(), rhsMemRefType.getShape(),
                      op->getContext());
-        unsigned MC = 64;
-        unsigned KC = 256;
-        unsigned NC = 512;
-        unsigned NR = 4;
-        unsigned MR = 4;
-        llvm::SmallVector<AffineForOp> loopNest;
-        getPerfectlyNestedLoops2(loopNest, loops.front());
-        // tile i with MC, j with NC, k with KC
-        llvm::SmallVector<AffineForOp> tiledNest;
-        if (failed(tilePerfectlyNested(loopNest, {MC, NC, KC}, &tiledNest))) {
-            std::cout << "Failed to tile the Loop nest" << std::endl;
-        };
-        // Further tile the i mod MC loop with MR
-        assert(tiledNest[0] == tiledNest[3]->getParentOp());
-        assert(tiledNest[1] == tiledNest[4]->getParentOp());
-        if (failed(tilePerfectlyNested(tiledNest[3], {MR}))) {
-            std::cout << "Failed to tile the second Loop nest" << std::endl;
-        };
-        
-        // Further tile the j mod NC loop with NR
-        assert(tiledNest[1] == tiledNest[4]->getParentOp());
-        if (failed(tilePerfectlyNested(tiledNest[4], {NR}))) {
-            std::cout << "Failed to tile the second j Loop" << std::endl;
-        };
-        llvm::SmallVector<AffineForOp> twiceTiledNest;
-        getPerfectlyNestedLoops2(twiceTiledNest, tiledNest[0]);
-        assert(twiceTiledNest[0].getStep() == MC);
-        assert(twiceTiledNest[3].getStep() == MR);
-        assert(twiceTiledNest[4].getStep() == 1);
-        assert(twiceTiledNest[1].getStep() == NC);
-        assert(twiceTiledNest[5].getStep() == NR);
-        assert(twiceTiledNest[7].getStep() == 1);
-        // std::cout << "The step size of what I think are the i loops should be 64, 4, 1 are " << twiceTiledNest[0].getStep() << ", " << twiceTiledNest[3].getStep() << ", " << twiceTiledNest[4].getStep() << std::endl;
-        // std::cout << "The step size of what I think are the j loops should be 512, 5, 1 are " << twiceTiledNest[1].getStep() << ", " << twiceTiledNest[5].getStep() << ", " << twiceTiledNest[6].getStep() << std::endl;
-        // std::cout << "The step size of what I think are the k loops should be 256, 1 are " << twiceTiledNest[2].getStep() << ", " << twiceTiledNest[7].getStep() << std::endl;
-        // std::cout << " Expect to have 8 loops and have " << twiceTiledNest.size() << std::endl;
-                                    
-        // permute loops to final order (i / MC, j / NC, k / KC, i / MR, i mod MR, j / NR, j mod NR, k mod KC) ->
-        //                              (j / NC, k / KC, i / MC, j / NR, i / MR, k mod KC, j mod NR, i mod MR)
-        assert(isValidLoopInterchangePermutation(twiceTiledNest, {2, 0, 1, 4, 7, 3, 6, 5}));
-        unsigned root_idx = permuteLoops(twiceTiledNest, {2, 0, 1, 4, 7, 3, 6, 5});
-
-
-        llvm::SmallVector<AffineForOp> blisTiledLoops;
-        getPerfectlyNestedLoops2(blisTiledLoops, twiceTiledNest[root_idx]); 
 
         mlir::Value DM = convertMemRefToDenseMatrix(loc, rewriter, outputMemRef,
                                                     op.getType());
@@ -294,6 +255,41 @@ class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
         return success();
     }
 };
+
+struct MatMulSplittingPattern : public OpRewritePattern<daphne::MatMulOp> {
+   MatMulSplittingPattern(mlir::MLIRContext *context) : OpRewritePattern<daphne::MatMulOp>(context) {}
+
+    LogicalResult matchAndRewrite(daphne::MatMulOp op, MatMulLowering::OpAdaptor adaptor,
+        PatternRewriter &rewriter) const {
+        auto loc = op->getLoc();
+        mlir::daphne::MatrixType lhsMatrixType =
+            adaptor.getLhs().getType().dyn_cast<mlir::daphne::MatrixType>();
+        mlir::daphne::MatrixType rhsMatrixType =
+            adaptor.getRhs().getType().dyn_cast<mlir::daphne::MatrixType>();
+
+        auto lhsRows = lhsMatrixType.getNumRows();
+        auto lhsCols = lhsMatrixType.getNumCols();
+
+        auto rhsRows = rhsMatrixType.getNumRows();
+        auto rhsCols = rhsMatrixType.getNumCols();
+        // Too small for splitting up to make sense
+        if (lhsRows < 500 || lhsCols < 500 || rhsRows < 500 || rhsCols < 500) {
+            return failure();
+        }
+        // TODO: Here I can't figure out how to make the rowSelection for the extractOp
+        auto indexType = rewriter.create<daphne::MatrixType>()
+        auto oneToH = rewriter.create<daphne::MatrixConstantOp>(loc, );
+        ArrayRef<Value> oneToHalf (value_vec.data(), value_vec.size());
+        auto small_upper_left_type = lhsMatrixType.withShape(6, 6);
+        auto lhs_upper_left = rewriter.create<daphne::ExtractOp>(loc, small_upper_left_type, adaptor.getLhs(), oneToHalf, oneToHalf);
+        auto rhs_upper_left = rewriter.create<daphne::ExtractOp>(loc, small_upper_left_type, adaptor.getRhs(), oneToHalf, oneToHalf);
+        auto matmul = rewriter.create<daphne::MatMulOp>(loc, small_upper_left_type, lhs_upper_left, rhs_upper_left, op.getTransa(), op.getTransb());
+        auto add = rewriter.create<daphne::EwAddOp>(loc, matmul.getRes(), matmul.getRes());
+        rewriter.replaceOp(op, {add});
+        return success();
+    }
+};
+
 
 namespace {
 /**
@@ -327,6 +323,30 @@ struct MatMulLoweringPass
 
 void MatMulLoweringPass::runOnOperation() {
     auto module = getOperation();
+    {
+        mlir::ConversionTarget target(getContext());
+        mlir::RewritePatternSet patterns(&getContext());
+        LowerToLLVMOptions llvmOptions(&getContext());
+        LLVMTypeConverter typeConverter(&getContext(), llvmOptions);
+
+        target.addLegalDialect<mlir::memref::MemRefDialect>();
+        target.addLegalDialect<mlir::arith::ArithDialect>();
+        target.addLegalDialect<mlir::scf::SCFDialect>();
+        target.addLegalDialect<mlir::AffineDialect>();
+        target.addLegalDialect<mlir::linalg::LinalgDialect>();
+        target.addLegalDialect<mlir::LLVM::LLVMDialect>();
+        target.addLegalDialect<mlir::math::MathDialect>();
+        target.addLegalDialect<mlir::vector::VectorDialect>();
+        patterns.insert<MatMulSplittingPattern>(&getContext());
+        
+        if (failed(applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+            module->dump();
+            signalPassFailure();
+        }
+        else {
+        std::cout << "Finished the MatMulSplitting" << std::endl;
+        }
+    }
     {
         mlir::ConversionTarget target(getContext());
         mlir::RewritePatternSet patterns(&getContext());
