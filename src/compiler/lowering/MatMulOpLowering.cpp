@@ -25,6 +25,7 @@
 #include "ir/daphneir/Passes.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
@@ -42,10 +43,13 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/UseDefLists.h"
+#include "mlir/IR/Value.h"
+#include "mlir/IR/ValueRange.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
@@ -56,65 +60,103 @@ using namespace mlir;
 static constexpr int ROW = 0;
 static constexpr int COL = 1;
 
+// Tiled inverted inner loops
 void affineMatMul(mlir::Value &lhs, mlir::Value &rhs, mlir::Value &output,
                   ConversionPatternRewriter &rewriter, mlir::Location loc,
                   ArrayRef<int64_t> lhsShape, ArrayRef<int64_t> rhsShape,
                   mlir::MLIRContext *ctx) {
-    SmallVector<Value, 4> loopIvs;
+    SmallVector<Value, 2> loopIvs;
+    int T = 16;
 
     // row loop
-    auto rowLoop = rewriter.create<AffineForOp>(loc, 0, lhsShape[ROW], 1);
+    auto rowLoop = rewriter.create<AffineForOp>(loc, 0, lhsShape[ROW], T);
     for (Operation &nested : *rowLoop.getBody()) {
         rewriter.eraseOp(&nested);
     }
-
-    // row loop body
     rewriter.setInsertionPointToStart(rowLoop.getBody());
 
-    // fma loop
-    auto innerLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[ROW], 1);
-    for (Operation &nested : *innerLoop.getBody()) {
-        rewriter.eraseOp(&nested);
-    }
-    rewriter.setInsertionPointToStart(innerLoop.getBody());
+        // lhs col loop
+        auto calcLoop = rewriter.create<AffineForOp>(loc, 0, lhsShape[COL], T);
+        for (Operation &nested : *calcLoop.getBody()) {
+            rewriter.eraseOp(&nested);
+        }
+        rewriter.setInsertionPointToStart(calcLoop.getBody());
+            loopIvs.push_back(rowLoop.getInductionVar());
+            loopIvs.push_back(calcLoop.getInductionVar());
+            // (rhs) col loop
+            auto colLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[COL], T);
+            for (Operation &nested : *colLoop.getBody()) {
+                rewriter.eraseOp(&nested);
+            }
+            rewriter.setInsertionPointToStart(colLoop.getBody());
+                // inner (lhs) row loop
+                AffineMap irow_ub_map = mlir::AffineMap::get(1, 0,
+                                                    ArrayRef<AffineExpr>{mlir::getAffineDimExpr(0, ctx) + T,
+                                                                                mlir::getAffineConstantExpr(lhsShape[ROW], ctx)},
+                                                    ctx);
+                auto irowLoop = rewriter.create<AffineForOp>(loc, ValueRange(rowLoop.getInductionVar()),
+                                                            mlir::AffineMap::getMinorIdentityMap(1, 1, ctx),
+                                                            ValueRange(rowLoop.getInductionVar()), irow_ub_map, 1);
+                for (Operation &nested : *irowLoop.getBody()) {
+                    rewriter.eraseOp(&nested);
+                }
+                rewriter.setInsertionPointToStart(irowLoop.getBody());
+                    // inner lhs col loop
+                    AffineMap icalc_ub_map = mlir::AffineMap::get(1, 0,
+                                                        ArrayRef<AffineExpr>{mlir::getAffineDimExpr(0, ctx) + T,
+                                                                                    mlir::getAffineConstantExpr(lhsShape[COL], ctx)},
+                                                        ctx);
+                    auto icalcLoop = rewriter.create<AffineForOp>(loc, ValueRange(calcLoop.getInductionVar()),
+                                                                mlir::AffineMap::getMinorIdentityMap(1, 1, ctx),
+                                                                ValueRange(calcLoop.getInductionVar()), icalc_ub_map, 1);
+                    for (Operation &nested : *icalcLoop.getBody()) {
+                        rewriter.eraseOp(&nested);
+                    }
+                    rewriter.setInsertionPointToStart(icalcLoop.getBody());
+                        // inner (rhs) col loop
+                        AffineMap icol_ub_map = mlir::AffineMap::get(1, 0,
+                                                            ArrayRef<AffineExpr>{mlir::getAffineDimExpr(0, ctx) + T,
+                                                                                        mlir::getAffineConstantExpr(rhsShape[COL], ctx)},
+                                                            ctx);
+                        auto icolLoop = rewriter.create<AffineForOp>(loc, ValueRange(colLoop.getInductionVar()),
+                                                                    mlir::AffineMap::getMinorIdentityMap(1, 1, ctx),
+                                                                    ValueRange(colLoop.getInductionVar()), icol_ub_map, 1);
+                        for (Operation &nested : *icolLoop.getBody()) {
+                            rewriter.eraseOp(&nested);
+                        }
+                        rewriter.setInsertionPointToStart(icolLoop.getBody());
 
-    // col loop
-    auto colLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[COL], 1);
-    for (Operation &nested : *colLoop.getBody()) {
-        rewriter.eraseOp(&nested);
-    }
+                            // load
+                            mlir::Value a = rewriter.create<memref::LoadOp>(
+                                loc, lhs, ValueRange{irowLoop.getInductionVar(), icalcLoop.getInductionVar()});
+                            mlir::Value b = rewriter.create<memref::LoadOp>(
+                                loc, rhs, ValueRange{icalcLoop.getInductionVar(), icolLoop.getInductionVar()});
+                            mlir::Value c = rewriter.create<memref::LoadOp>(
+                                loc, output, ValueRange{irowLoop.getInductionVar(), icolLoop.getInductionVar()});
+                                
+                            // fma
+                            mlir::Value mult = rewriter.create<arith::MulFOp>(loc, a, b);
+                            mlir::Value fma = rewriter.create<arith::AddFOp>(loc, mult, c);
 
-    // col loop body
-    rewriter.setInsertionPointToStart(colLoop.getBody());
+                            // store
+                            rewriter.create<memref::StoreOp>(loc, fma, output,
+                                            ValueRange{irowLoop.getInductionVar(), icolLoop.getInductionVar()});
+                            rewriter.create<AffineYieldOp>(loc);
+                            rewriter.setInsertionPointAfter(icolLoop);
+                        rewriter.create<AffineYieldOp>(loc);
+                        rewriter.setInsertionPointAfter(icalcLoop);
+                    rewriter.create<AffineYieldOp>(loc);
+                    rewriter.setInsertionPointAfter(irowLoop);       
+                rewriter.create<AffineYieldOp>(loc);
+                rewriter.setInsertionPointAfter(colLoop);
+            rewriter.create<AffineYieldOp>(loc);
+            rewriter.setInsertionPointAfter(calcLoop);
+        rewriter.create<AffineYieldOp>(loc);
+        rewriter.setInsertionPointAfter(rowLoop);     
 
-    loopIvs.push_back(rowLoop.getInductionVar());
-    loopIvs.push_back(colLoop.getInductionVar());
-    loopIvs.push_back(innerLoop.getInductionVar());
-
-    // load
-    mlir::Value a = rewriter.create<memref::LoadOp>(
-        loc, lhs, ValueRange{loopIvs[0], loopIvs[2]});
-    mlir::Value b = rewriter.create<memref::LoadOp>(
-        loc, rhs, ValueRange{loopIvs[2], loopIvs[1]});
-    mlir::Value c = rewriter.create<memref::LoadOp>(
-        loc, output, ValueRange{loopIvs[0], loopIvs[1]});
-
-    // fma
-    mlir::Value fma = rewriter.create<LLVM::FMAOp>(loc, a, b, c);
-
-    // store
-    rewriter.create<memref::StoreOp>(loc, fma, output,
-                                     ValueRange{loopIvs[0], loopIvs[1]});
-
-    // AffineYieldOp at end of loop blocks
-    rewriter.setInsertionPointToEnd(rowLoop.getBody());
-    rewriter.create<AffineYieldOp>(loc);
-    rewriter.setInsertionPointToEnd(colLoop.getBody());
-    rewriter.create<AffineYieldOp>(loc);
-    rewriter.setInsertionPointToEnd(innerLoop.getBody());
-    rewriter.create<AffineYieldOp>(loc);
-    rewriter.setInsertionPointAfter(rowLoop);
+    // Now back at this level
 }
+
 
 class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
    public:
@@ -178,13 +220,9 @@ class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
 namespace {
 /**
  * @brief The MatMulLoweringPass rewrites the MatMulOp from the DaphneDialect
- * to a affine loop structure implementing a naive iterative matrix
- * multiplication.
+ * to a affine loop structure implementing a tiled loop structure with inverted inner loops.
  *
- * The naive iterative algorithm is simply a perfectly nested
- * loop algorithm running in O(n^3) performing the 3 load operations in it's
- * inner loop body, calculates an FMA and stores the result in the output
- * matrix.
+ * The tiling size is hard coded to 16 on all three of the naive loops.
  */
 struct MatMulLoweringPass
     : public mlir::PassWrapper<MatMulLoweringPass,
@@ -194,7 +232,7 @@ struct MatMulLoweringPass
     StringRef getArgument() const final { return "lower-mm"; }
     StringRef getDescription() const final {
         return "This pass lowers the MatMulOp to an affine loop structure "
-               "performing a naive iterative matrix multiplication.";
+               "performing a tiled iterative matrix multiplication.";
     }
 
     void getDependentDialects(mlir::DialectRegistry &registry) const override {
