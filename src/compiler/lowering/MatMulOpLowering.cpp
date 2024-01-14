@@ -70,50 +70,46 @@ void affineMatMul(mlir::Value &lhs, mlir::Value &rhs, mlir::Value &output,
 
     // row loop body
     rewriter.setInsertionPointToStart(rowLoop.getBody());
-
-    // fma loop
-    auto innerLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[ROW], 1);
-    for (Operation &nested : *innerLoop.getBody()) {
-        rewriter.eraseOp(&nested);
-    }
-    rewriter.setInsertionPointToStart(innerLoop.getBody());
-
     // col loop
-    auto colLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[COL], 1);
-    for (Operation &nested : *colLoop.getBody()) {
-        rewriter.eraseOp(&nested);
-    }
+        auto colLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[COL], 1);
+        for (Operation &nested : *colLoop.getBody()) {
+            rewriter.eraseOp(&nested);
+        }
+        rewriter.setInsertionPointToStart(colLoop.getBody());
+            loopIvs.push_back(rowLoop.getInductionVar());
+            loopIvs.push_back(colLoop.getInductionVar());
 
-    // col loop body
-    rewriter.setInsertionPointToStart(colLoop.getBody());
+            Value accumulator = rewriter.create<mlir::arith::ConstantOp>(
+                    loc, rewriter.getF64Type(), rewriter.getF64FloatAttr(0));
 
-    loopIvs.push_back(rowLoop.getInductionVar());
-    loopIvs.push_back(colLoop.getInductionVar());
-    loopIvs.push_back(innerLoop.getInductionVar());
+            // inner loop
+            auto innerLoop = rewriter.create<AffineForOp>(loc, 0, rhsShape[ROW], 1, ValueRange{accumulator});
+            for (Operation &nested : *innerLoop.getBody()) {
+                rewriter.eraseOp(&nested);
+            }
+            rewriter.setInsertionPointToStart(innerLoop.getBody());
+                // load
+                mlir::Value a = rewriter.create<memref::LoadOp>(
+                    loc, lhs, ValueRange{loopIvs[0], innerLoop.getInductionVar()});
+                mlir::Value b = rewriter.create<memref::LoadOp>(
+                    loc, rhs, ValueRange{innerLoop.getInductionVar(), loopIvs[1]});
+                
+                // fma
+                mlir::Value mult = rewriter.create<arith::MulFOp>(loc, a, b);
+                mlir::Value fma = rewriter.create<arith::AddFOp>(loc, mult, innerLoop.getRegionIterArgs()[0]);
+                
+                rewriter.create<AffineYieldOp>(loc, fma);
+                rewriter.setInsertionPointAfter(innerLoop);
+                
+            rewriter.create<memref::StoreOp>(loc, innerLoop->getResult(0), output,
+                                            ValueRange{loopIvs[0], loopIvs[1]});
 
-    // load
-    mlir::Value a = rewriter.create<memref::LoadOp>(
-        loc, lhs, ValueRange{loopIvs[0], loopIvs[2]});
-    mlir::Value b = rewriter.create<memref::LoadOp>(
-        loc, rhs, ValueRange{loopIvs[2], loopIvs[1]});
-    mlir::Value c = rewriter.create<memref::LoadOp>(
-        loc, output, ValueRange{loopIvs[0], loopIvs[1]});
+            rewriter.create<AffineYieldOp>(loc);
+            rewriter.setInsertionPointAfter(colLoop);
+        rewriter.create<AffineYieldOp>(loc);
+        rewriter.setInsertionPointAfter(rowLoop);     
 
-    // fma
-    mlir::Value fma = rewriter.create<LLVM::FMAOp>(loc, a, b, c);
-
-    // store
-    rewriter.create<memref::StoreOp>(loc, fma, output,
-                                     ValueRange{loopIvs[0], loopIvs[1]});
-
-    // AffineYieldOp at end of loop blocks
-    rewriter.setInsertionPointToEnd(rowLoop.getBody());
-    rewriter.create<AffineYieldOp>(loc);
-    rewriter.setInsertionPointToEnd(colLoop.getBody());
-    rewriter.create<AffineYieldOp>(loc);
-    rewriter.setInsertionPointToEnd(innerLoop.getBody());
-    rewriter.create<AffineYieldOp>(loc);
-    rewriter.setInsertionPointAfter(rowLoop);
+    // Now back at this level
 }
 
 class MatMulLowering : public OpConversionPattern<daphne::MatMulOp> {
@@ -181,10 +177,10 @@ namespace {
  * to a affine loop structure implementing a naive iterative matrix
  * multiplication.
  *
- * The naive iterative algorithm is simply a perfectly nested
- * loop algorithm running in O(n^3) performing the 3 load operations in it's
- * inner loop body, calculates an FMA and stores the result in the output
- * matrix.
+ * The naive iterative algorithm is simply a nested
+ * loop algorithm running in O(n^3). Using an accumulator 2 load operations in the
+ * inner loop body are used to calculate the vector product, which is stored after
+ * each inner loop.
  */
 struct MatMulLoweringPass
     : public mlir::PassWrapper<MatMulLoweringPass,
